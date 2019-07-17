@@ -58,6 +58,7 @@ from .utils import _normalize_sku, get_sku_name
 from ._create_util import (zip_contents_from_dir, get_runtime_version_details, create_resource_group,
                            should_create_new_rg, set_location, should_create_new_app,
                            get_lang_from_content, get_num_apps_in_asp)
+from ._acr_util import (queue_acr_build, generate_img_name, get_acr_cred, validate_src_dir)
 from ._constants import (NODE_RUNTIME_NAME, OS_DEFAULT, STATIC_RUNTIME_NAME, PYTHON_RUNTIME_NAME,
                          RUNTIME_TO_IMAGE, NODE_VERSION_DEFAULT)
 
@@ -923,7 +924,7 @@ def update_container_settings(cmd, resource_group_name, name, docker_registry_se
         parsed = urlparse(docker_registry_server_url)
         registry_name = (parsed.netloc if parsed.scheme else parsed.path).split('.')[0]
         try:
-            docker_registry_server_user, docker_registry_server_password = _get_acr_cred(cmd.cli_ctx, registry_name)
+            docker_registry_server_user, docker_registry_server_password = get_acr_cred(cmd.cli_ctx, registry_name)
         except Exception as ex:  # pylint: disable=broad-except
             logger.warning("Retrieving credentials failed with an exception:'%s'", ex)  # consider throw if needed
 
@@ -958,27 +959,6 @@ def update_container_settings_functionapp(cmd, resource_group_name, name, docker
                                      docker_custom_image_name, docker_registry_server_user, None,
                                      docker_registry_server_password, multicontainer_config_type=None,
                                      multicontainer_config_file=None, slot=slot)
-
-
-def _get_acr_cred(cli_ctx, registry_name):
-    from azure.mgmt.containerregistry import ContainerRegistryManagementClient
-    from azure.cli.core.commands.parameters import get_resources_in_subscription
-    client = get_mgmt_service_client(cli_ctx, ContainerRegistryManagementClient).registries
-
-    result = get_resources_in_subscription(cli_ctx, 'Microsoft.ContainerRegistry/registries')
-    result = [item for item in result if item.name.lower() == registry_name]
-    if not result or len(result) > 1:
-        raise CLIError("No resource or more than one were found with name '{}'.".format(registry_name))
-    resource_group_name = parse_resource_id(result[0].id)['resource_group']
-
-    registry = client.get(resource_group_name, registry_name)
-
-    if registry.admin_user_enabled:  # pylint: disable=no-member
-        cred = client.list_credentials(resource_group_name, registry_name)
-        return cred.username, cred.passwords[0].value
-    raise CLIError("Failed to retrieve container registry credentials. Please either provide the "
-                   "credentials or run 'az acr update -n {} --admin-enabled true' to enable "
-                   "admin first.".format(registry_name))
 
 
 def delete_container_settings(cmd, resource_group_name, name, slot=None):
@@ -2407,11 +2387,7 @@ def webapp_up(cmd, name, resource_group_name=None, plan=None,  # pylint: disable
     client = web_client_factory(cmd.cli_ctx)
     # the code to deploy is expected to be the current directory the command is running from
     src_dir = os.getcwd()
-    user = Profile().get_current_account_user()
-    user = user.split('@', 1)[0]
-    if len(user.split('#', 1)) > 1:  # on cloudShell user is in format live.com#user@domain.com
-        user = user.split('#', 1)[1]
-    logger.info("UserPrefix to use '%s'", user)
+    user = _get_up_user_prefix()
     # if dir is empty, show a message in dry run
     do_deployment = False if os.listdir(src_dir) == [] else True
     _create_new_rg = True
@@ -2450,13 +2426,7 @@ def webapp_up(cmd, name, resource_group_name=None, plan=None,  # pylint: disable
     location = set_location(cmd, sku, location)
     loc_name = location.replace(" ", "").lower()
     is_linux = True if os_val == 'Linux' else False
-
-    if resource_group_name is None:
-        logger.info('Using default ResourceGroup value')
-        rg_name = "{}_rg_{}_{}".format(user, os_val, loc_name)
-    else:
-        logger.info("Found user input for ResourceGroup %s", resource_group_name)
-        rg_name = resource_group_name
+    rg_name = _get_up_rg_name(resource_group_name, user, os_val, loc_name)
 
     if plan is None:
         logger.info('Using default appserviceplan value')
@@ -2616,6 +2586,245 @@ def webapp_up(cmd, name, resource_group_name=None, plan=None,  # pylint: disable
         _configure_default_logging(cmd, rg_name, name)
         return get_streaming_log(cmd, rg_name, name)
     return create_json
+
+
+def webapp_container_up(cmd, name, resource_group_name=None, plan=None, location=None, registry_rg=None, registry_name=None, src_dir=None, docker_custom_image_name=None, dryrun=False, logs=False, launch_browser=False):  # pylint: disable=too-many-statements
+    import os
+
+    _create_new_rg = True
+    _create_new_asp = True
+    _create_new_app = True
+    _set_build_app_setting = False
+    _create_acr_img = True
+
+    if docker_custom_image_name:
+        logger.warning('Image will be pulled from DockerHub')
+        img_name = docker_custom_image_name
+        _create_acr_img = False
+        container_image = img_name
+        src_path = 'None'
+        registry = 'DockerHub'
+    else:
+        logger.warning('Source code will be uploaded and built in Azure Container Registry')
+        if not src_dir:
+            # the dockerfile is expected to be in the root of the source location
+            src_dir = os.getcwd()
+        validate_src_dir(src_dir)
+        img_name = generate_img_name(src_dir)
+        if not registry_name:
+            raise CLIError("--registry-name not specified")
+        if not registry_rg:
+            raise CLIError("--registry-rg not specified")
+        container_image = registry_name + '.azurecr.io/' + img_name
+        src_path = "{}".format(src_dir.replace("\\", "\\\\"))
+        registry = 'Azure Container Registry'
+
+    user = _get_up_user_prefix()
+    sku = 'P1V2'
+    full_sku = get_sku_name(sku)
+    location = set_location(cmd, sku, location)
+    loc_name = location.replace(" ", "").lower()
+    # currently, only Linux containers are supported
+    os_val = 'Linux'
+    is_linux = True
+    rg_name = _get_up_rg_name(resource_group_name, user, os_val, loc_name)
+
+    if plan is None:
+        logger.info('Using default appserviceplan value')
+        asp = "{}_asp_{}_{}_0".format(user, os_val, loc_name)
+        _asp_generic = asp[:-len(asp.split("_")[4])]  # used to determine if a new ASP needs to be created
+    else:
+        asp = plan
+        _asp_generic = asp
+    _create_new_rg = should_create_new_rg(cmd, rg_name, is_linux)
+    logger.info("Should create new RG %s", _create_new_rg)
+    rg_str = "{}".format(rg_name)
+    dry_run_str = r""" {
+            "name" : "%s",
+            "appserviceplan" : "%s",
+            "resourcegroup" : "%s",
+            "sku": "%s",
+            "os": "%s",
+            "location" : "%s",
+            "src_path" : "%s",
+            "registry" : "%s",
+            "container_image" : "%s"
+            }
+            """ % (name, asp, rg_str, full_sku, os_val, location, src_path, registry, container_image)
+    create_json = json.loads(dry_run_str)
+    if dryrun:
+        logger.warning("Web app will be created with the below configuration. Re-run command "
+                       "without the --dryrun flag to create & deploy a new app")
+        return create_json
+
+    # create RG if the RG doesn't already exist
+    if _create_new_rg:
+        logger.warning("Creating Resource group '%s' ...", rg_name)
+        create_resource_group(cmd, rg_name, location)
+        logger.warning("Resource group creation complete")
+        _create_new_asp = True
+    else:
+        logger.warning("Resource group '%s' already exists.", rg_name)
+        #asp, _create_new_asp = _get_up_asp()
+        # get all asp in the RG
+        logger.warning("Verifying if the plan with the same sku exists or should create a new plan")
+        client = web_client_factory(cmd.cli_ctx)
+        data = (list(filter(lambda x: _asp_generic in x.name,
+                            client.app_service_plans.list_by_resource_group(rg_name))))
+        data_sorted = (sorted(data, key=lambda x: x.name))
+        num_asps = len(data)
+        # check if any of these matches the SKU & location to be used
+        # and get FirstOrDefault
+        selected_asp = next((a for a in data if isinstance(a.sku, SkuDescription) and
+                             a.sku.tier.lower() == full_sku.lower() and
+                             (a.location.replace(" ", "").lower() == location.lower() or a.location == location)), None)
+        if selected_asp is not None:
+            asp = selected_asp.name
+            _create_new_asp = False
+        elif selected_asp is None and num_asps > 0:
+            # from the sorted data pick the last one & check if a new ASP needs to be created
+            # based on SKU or not
+            _plan_info = data_sorted[num_asps - 1]
+            if plan is None:
+                _asp_num = int(_plan_info.name.split('_')[4]) + 1
+                asp = "{}_asp_{}_{}_{}".format(user, os_val, loc_name, _asp_num)
+            else:
+                asp = plan
+
+    # create new ASP if an existing one cannot be used
+    if _create_new_asp:
+        logger.warning("Creating App service plan '%s' ...", asp)
+        create_app_service_plan(cmd, rg_name, asp, is_linux, None, sku, 1 if is_linux else None, location)
+        logger.warning("App service plan creation complete")
+        create_json['appserviceplan'] = asp
+        _create_new_app = True
+        _show_too_many_apps_warn = False
+    else:
+        logger.warning("App service plan '%s' already exists.", asp)
+        _show_too_many_apps_warn = get_num_apps_in_asp(cmd, rg_name, asp) > 5
+        _create_new_app = should_create_new_app(cmd, rg_name, name)
+
+    #### BEGIN CONTAINER ####
+    # create the app
+    if _create_new_app:
+        logger.warning("Creating app '%s' ....", name)
+        # TODO: Deploy without container params and update separately instead?
+        # deployment_container_image_name=docker_custom_image_name)
+        create_webapp(cmd, rg_name, name, asp, deployment_container_image_name=img_name) 
+        logger.warning("Webapp creation complete")
+        create_json['name'] = name
+        _configure_default_logging(cmd, rg_name, name)
+        if _show_too_many_apps_warn:
+            logger.warning("There are sites that have been deployed to the same hosting "
+                           "VM of this region, to prevent performance impact please "
+                           "delete existing site(s) or switch to a different default resource group "
+                           "using 'az configure' command")
+    else:
+        logger.warning("App '%s' already exists", name) # Set up the container
+
+    if _create_acr_img:
+        logger.warning("Starting ACR build")
+        queue_acr_build(cmd, registry_rg, registry_name, img_name, src_dir)
+        logger.warning("ACR build done. Configuring ACR settings.")
+        registry_url = 'https://' + registry_name + '.azurecr.io'
+        acr_img_name = registry_name + '.azurecr.io/' + img_name
+        update_container_settings(cmd, rg_name, name, registry_url, acr_img_name)
+    #### END CONTAINER ####
+
+    logger.warning("All done.")
+    with ConfiguredDefaultSetter(cmd.cli_ctx.config, True):
+        cmd.cli_ctx.config.set_value('defaults', 'group', rg_name)
+        cmd.cli_ctx.config.set_value('defaults', 'sku', full_sku)
+        cmd.cli_ctx.config.set_value('defaults', 'appserviceplan', asp)
+        cmd.cli_ctx.config.set_value('defaults', 'location', location)
+        cmd.cli_ctx.config.set_value('defaults', 'web', name)
+    if launch_browser:
+        logger.warning("Launching app using default browser")
+        view_in_browser(cmd, rg_name, name, None, logs)
+    else:
+        _url = _get_url(cmd, rg_name, name)
+        logger.warning("You can launch the app at %s", _url)
+        create_json.update({'app_url': _url})
+    if logs:
+        _configure_default_logging(cmd, rg_name, name)
+        return get_streaming_log(cmd, rg_name, name)
+    return create_json
+
+
+def _get_up_user_prefix():
+    from azure.cli.core._profile import Profile
+    user = Profile().get_current_account_user()
+    user = user.split('@', 1)[0]
+    if len(user.split('#', 1)) > 1:  # on cloudShell user is in format live.com#user@domain.com
+        user = user.split('#', 1)[1]
+    logger.info("UserPrefix to use '%s'", user)
+    return user
+
+
+def _get_up_rg_name(resource_group_name, user, os_val, loc_name):
+    if resource_group_name is None:
+        logger.info('Using default ResourceGroup value')
+        return "{}_rg_{}_{}".format(user, os_val, loc_name)
+    else:
+        logger.info("Found user input for ResourceGroup %s", resource_group_name)
+        return resource_group_name
+
+
+def _create_rg_and_asp(cmd, _asp_generic, rg_name, location, sku, plan, is_linux, app_name):
+    _create_new_rg = should_create_new_rg(cmd, rg_name, is_linux)
+    _create_new_asp = True
+    full_sku = get_sku_name(sku)
+    # create RG if the RG doesn't already exist
+    if _create_new_rg:
+        logger.warning("Creating Resource group '%s' ...", rg_name)
+        create_resource_group(cmd, rg_name, location)
+        logger.warning("Resource group creation complete")
+        _create_new_asp = True
+    else:
+        logger.warning("Resource group '%s' already exists.", rg_name)
+        # get all asp in the RG
+        logger.warning("Verifying if the plan with the same sku exists or should create a new plan")
+        client = web_client_factory(cmd.cli_ctx)
+        data = (list(filter(lambda x: _asp_generic in x.name,
+                            client.app_service_plans.list_by_resource_group(rg_name))))
+        data_sorted = (sorted(data, key=lambda x: x.name))
+        num_asps = len(data)
+        # check if any of these matches the SKU & location to be used
+        # and get FirstOrDefault
+        selected_asp = next((a for a in data if isinstance(a.sku, SkuDescription) and
+                             a.sku.tier.lower() == full_sku.lower() and
+                             (a.location.replace(" ", "").lower() == location.lower() or a.location == location)), None)
+        if selected_asp is not None:
+            asp = selected_asp.name
+            _create_new_asp = False
+        elif selected_asp is None and num_asps > 0:
+            if plan is None:
+                # from the sorted data pick the last one & check if a new ASP needs to be created
+                # based on SKU or not
+                _plan_info = data_sorted[num_asps - 1]
+                _asp_num = int(_plan_info.name.split('_')[4]) + 1
+                #asp = "{}_asp_{}_{}_{}".format(user, os_val, loc_name, _asp_num)
+                # Todo: Move this outside
+                default_asp_name_base = "{}_asp_{}_{}".format(user, os_val, loc_name)
+                asp = "{}_{}".format(default_asp_name_base, _asp_num)
+            else:
+                asp = plan
+
+    # create new ASP if an existing one cannot be used
+    if _create_new_asp:
+        logger.warning("Creating App service plan '%s' ...", asp)
+        create_app_service_plan(cmd, rg_name, asp, is_linux, None, sku, 1 if is_linux else None, location)
+        logger.warning("App service plan creation complete")
+        create_json['appserviceplan'] = asp
+        _create_new_app = True
+        _show_too_many_apps_warn = False
+    else:
+        logger.warning("App service plan '%s' already exists.", asp)
+        _show_too_many_apps_warn = get_num_apps_in_asp(cmd, rg_name, asp) > 5
+        _create_new_app = should_create_new_app(cmd, rg_name, app_name)
+    
+    #return: asp name, _create_new_app, _show_too_many
+    #set the create json asp name
 
 
 def _ping_scm_site(cmd, resource_group, name):

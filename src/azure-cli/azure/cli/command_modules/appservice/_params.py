@@ -373,6 +373,25 @@ def load_arguments(self, _):
         c.argument('launch_browser', help="Launch the created app using the default browser", default=False, action='store_true', options_list=['--launch-browser', '-b'])
         c.argument('logs', help="Configure default logging required to enable viewing log stream immediately after launching the webapp", default=False, action='store_true')
 
+    with self.argument_context('webapp container up') as c:
+        c.argument('name', arg_type=webapp_name_arg_type)
+        c.argument('resource_group_name', arg_type=resource_group_name_type)
+        c.argument('plan', options_list=['--plan', '-p'], configured_default='appserviceplan',
+                   completer=get_resource_name_completion_list('Microsoft.Web/serverFarms'),
+                   help="name of the appserviceplan associated with the webapp")
+        c.argument('location', arg_type=get_location_type(self.cli_ctx))
+        c.argument('registry_rg', options_list=['--registry-rg'],
+                    help='resource group of the Azure Container Registry')
+        c.argument('registry_name', options_list=['--registry-name'],
+                    help='name of the Azure Container Registry')
+        c.argument('src_dir', options_list=['--source-directory', '-s'],
+                    help='the path to the web app source directory')
+        c.argument('docker_custom_image_name', options_list=['--docker-custom-image-name', '-i'],
+                    help='the container image name and optionally the tag name (currently public DockerHub images only)')
+        c.argument('dryrun', help="show summary of the create and deploy operation instead of executing it", default=False, action='store_true')
+        c.argument('launch_browser', help="Launch the created app using the default browser", default=False, action='store_true', options_list=['--launch-browser', '-b'])
+        c.argument('logs', help="Configure default logging required to enable viewing log stream immediately after launching the webapp", default=False, action='store_true')
+
     with self.argument_context('webapp ssh') as c:
         c.argument('port', options_list=['--port', '-p'],
                    help='Port for the remote connection. Default: Random available port', type=int)
