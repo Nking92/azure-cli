@@ -2658,51 +2658,9 @@ def webapp_container_up(cmd, name, resource_group_name=None, plan=None, location
         return create_json
 
     # create RG if the RG doesn't already exist
-    if _create_new_rg:
-        logger.warning("Creating Resource group '%s' ...", rg_name)
-        create_resource_group(cmd, rg_name, location)
-        logger.warning("Resource group creation complete")
-        _create_new_asp = True
-    else:
-        logger.warning("Resource group '%s' already exists.", rg_name)
-        #asp, _create_new_asp = _get_up_asp()
-        # get all asp in the RG
-        logger.warning("Verifying if the plan with the same sku exists or should create a new plan")
-        client = web_client_factory(cmd.cli_ctx)
-        data = (list(filter(lambda x: _asp_generic in x.name,
-                            client.app_service_plans.list_by_resource_group(rg_name))))
-        data_sorted = (sorted(data, key=lambda x: x.name))
-        num_asps = len(data)
-        # check if any of these matches the SKU & location to be used
-        # and get FirstOrDefault
-        selected_asp = next((a for a in data if isinstance(a.sku, SkuDescription) and
-                             a.sku.tier.lower() == full_sku.lower() and
-                             (a.location.replace(" ", "").lower() == location.lower() or a.location == location)), None)
-        if selected_asp is not None:
-            asp = selected_asp.name
-            _create_new_asp = False
-        elif selected_asp is None and num_asps > 0:
-            # from the sorted data pick the last one & check if a new ASP needs to be created
-            # based on SKU or not
-            _plan_info = data_sorted[num_asps - 1]
-            if plan is None:
-                _asp_num = int(_plan_info.name.split('_')[4]) + 1
-                asp = "{}_asp_{}_{}_{}".format(user, os_val, loc_name, _asp_num)
-            else:
-                asp = plan
-
-    # create new ASP if an existing one cannot be used
-    if _create_new_asp:
-        logger.warning("Creating App service plan '%s' ...", asp)
-        create_app_service_plan(cmd, rg_name, asp, is_linux, None, sku, 1 if is_linux else None, location)
-        logger.warning("App service plan creation complete")
-        create_json['appserviceplan'] = asp
-        _create_new_app = True
-        _show_too_many_apps_warn = False
-    else:
-        logger.warning("App service plan '%s' already exists.", asp)
-        _show_too_many_apps_warn = get_num_apps_in_asp(cmd, rg_name, asp) > 5
-        _create_new_app = should_create_new_app(cmd, rg_name, name)
+    default_asp_name_base = "{}_asp_{}_{}".format(user, os_val, loc_name)
+    asp, _create_new_app, _show_too_many_apps_warn = _create_rg_and_asp(cmd, rg_name, location, sku, plan, is_linux, name, default_asp_name_base)
+    create_json['appserviceplan'] = asp
 
     #### BEGIN CONTAINER ####
     # create the app
@@ -2770,7 +2728,7 @@ def _get_up_rg_name(resource_group_name, user, os_val, loc_name):
         return resource_group_name
 
 
-def _create_rg_and_asp(cmd, _asp_generic, rg_name, location, sku, plan, is_linux, app_name):
+def _create_rg_and_asp(cmd, rg_name, location, sku, plan, is_linux, app_name, default_asp_name_base):
     _create_new_rg = should_create_new_rg(cmd, rg_name, is_linux)
     _create_new_asp = True
     full_sku = get_sku_name(sku)
@@ -2785,6 +2743,7 @@ def _create_rg_and_asp(cmd, _asp_generic, rg_name, location, sku, plan, is_linux
         # get all asp in the RG
         logger.warning("Verifying if the plan with the same sku exists or should create a new plan")
         client = web_client_factory(cmd.cli_ctx)
+        _asp_generic = plan if plan is not None else default_asp_name_base
         data = (list(filter(lambda x: _asp_generic in x.name,
                             client.app_service_plans.list_by_resource_group(rg_name))))
         data_sorted = (sorted(data, key=lambda x: x.name))
@@ -2803,9 +2762,6 @@ def _create_rg_and_asp(cmd, _asp_generic, rg_name, location, sku, plan, is_linux
                 # based on SKU or not
                 _plan_info = data_sorted[num_asps - 1]
                 _asp_num = int(_plan_info.name.split('_')[4]) + 1
-                #asp = "{}_asp_{}_{}_{}".format(user, os_val, loc_name, _asp_num)
-                # Todo: Move this outside
-                default_asp_name_base = "{}_asp_{}_{}".format(user, os_val, loc_name)
                 asp = "{}_{}".format(default_asp_name_base, _asp_num)
             else:
                 asp = plan
@@ -2815,7 +2771,7 @@ def _create_rg_and_asp(cmd, _asp_generic, rg_name, location, sku, plan, is_linux
         logger.warning("Creating App service plan '%s' ...", asp)
         create_app_service_plan(cmd, rg_name, asp, is_linux, None, sku, 1 if is_linux else None, location)
         logger.warning("App service plan creation complete")
-        create_json['appserviceplan'] = asp
+        #create_json['appserviceplan'] = asp
         _create_new_app = True
         _show_too_many_apps_warn = False
     else:
@@ -2825,6 +2781,7 @@ def _create_rg_and_asp(cmd, _asp_generic, rg_name, location, sku, plan, is_linux
     
     #return: asp name, _create_new_app, _show_too_many
     #set the create json asp name
+    return asp, _create_new_app, _show_too_many_apps_warn
 
 
 def _ping_scm_site(cmd, resource_group, name):
