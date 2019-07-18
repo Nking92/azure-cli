@@ -10,7 +10,7 @@ from datetime import datetime
 from knack.log import get_logger
 from knack.util import CLIError
 
-from msrestazure.tools import is_valid_resource_id, parse_resource_id
+from msrestazure.tools import parse_resource_id
 
 from azure.cli.command_modules.acr._archive_utils import upload_source_code
 from azure.cli.command_modules.acr._stream_utils import stream_logs

@@ -7,10 +7,16 @@ import os
 import zipfile
 from azure.cli.core.commands.client_factory import get_mgmt_service_client
 from azure.mgmt.resource.resources.models import ResourceGroup
+from azure.mgmt.web.models import SkuDescription, AppServicePlan
+from knack.log import get_logger
+from knack.util import CLIError
+from .utils import get_sku_name, get_location_from_resource_group, _normalize_sku
 from ._constants import (NETCORE_VERSION_DEFAULT, NETCORE_VERSIONS, NODE_VERSION_DEFAULT,
                          NODE_VERSIONS, NETCORE_RUNTIME_NAME, NODE_RUNTIME_NAME, DOTNET_RUNTIME_NAME,
                          DOTNET_VERSION_DEFAULT, DOTNET_VERSIONS, STATIC_RUNTIME_NAME,
                          PYTHON_RUNTIME_NAME, PYTHON_VERSION_DEFAULT, LINUX_SKU_DEFAULT)
+
+logger = get_logger(__name__)
 
 
 def _resource_client_factory(cli_ctx, **_):
@@ -269,3 +275,90 @@ def should_create_new_rg(cmd, rg_name, is_linux):
             _check_resource_group_supports_os(cmd, rg_name, is_linux)):
         return False
     return True
+
+def get_up_user_prefix():
+    from azure.cli.core._profile import Profile
+    user = Profile().get_current_account_user()
+    user = user.split('@', 1)[0]
+    if len(user.split('#', 1)) > 1:  # on cloudShell user is in format live.com#user@domain.com
+        user = user.split('#', 1)[1]
+    logger.info("UserPrefix to use '%s'", user)
+    return user
+
+
+def get_up_rg_name(resource_group_name, user, os_val, loc_name):
+    if resource_group_name is None:
+        logger.info('Using default ResourceGroup value')
+        return "{}_rg_{}_{}".format(user, os_val, loc_name)
+    else:
+        logger.info("Found user input for ResourceGroup %s", resource_group_name)
+        return resource_group_name
+
+
+def create_rg_and_asp(cmd, rg_name, location, sku, plan, is_linux, app_name, default_asp_name_base):
+    _create_new_rg = should_create_new_rg(cmd, rg_name, is_linux)
+    _create_new_asp = True
+    full_sku = get_sku_name(sku)
+    # create RG if the RG doesn't already exist
+    if _create_new_rg:
+        logger.warning("Creating Resource group '%s' ...", rg_name)
+        create_resource_group(cmd, rg_name, location)
+        logger.warning("Resource group creation complete")
+        _create_new_asp = True
+    else:
+        logger.warning("Resource group '%s' already exists.", rg_name)
+        # get all asp in the RG
+        logger.warning("Verifying if the plan with the same sku exists or should create a new plan")
+        client = web_client_factory(cmd.cli_ctx)
+        _asp_generic = plan if plan is not None else default_asp_name_base
+        data = (list(filter(lambda x: _asp_generic in x.name,
+                            client.app_service_plans.list_by_resource_group(rg_name))))
+        data_sorted = (sorted(data, key=lambda x: x.name))
+        num_asps = len(data)
+        # check if any of these matches the SKU & location to be used
+        # and get FirstOrDefault
+        selected_asp = next((a for a in data if isinstance(a.sku, SkuDescription) and
+                             a.sku.tier.lower() == full_sku.lower() and
+                             (a.location.replace(" ", "").lower() == location.lower() or a.location == location)), None)
+        if selected_asp is not None:
+            asp = selected_asp.name
+            _create_new_asp = False
+        elif selected_asp is None and num_asps > 0:
+            if plan is None:
+                # from the sorted data pick the last one & check if a new ASP needs to be created
+                # based on SKU or not
+                _plan_info = data_sorted[num_asps - 1]
+                _asp_num = int(_plan_info.name.split('_')[4]) + 1
+                asp = "{}_{}".format(default_asp_name_base, _asp_num)
+            else:
+                asp = plan
+
+    # create new ASP if an existing one cannot be used
+    if _create_new_asp:
+        logger.warning("Creating App service plan '%s' ...", asp)
+        create_app_service_plan(cmd, rg_name, asp, is_linux, None, sku, 1 if is_linux else None, location)
+        logger.warning("App service plan creation complete")
+        _create_new_app = True
+        _show_too_many_apps_warn = False
+    else:
+        logger.warning("App service plan '%s' already exists.", asp)
+        _show_too_many_apps_warn = get_num_apps_in_asp(cmd, rg_name, asp) > 5
+        _create_new_app = should_create_new_app(cmd, rg_name, app_name)
+
+    return asp, _create_new_app, _show_too_many_apps_warn
+
+
+def create_app_service_plan(cmd, resource_group_name, name, is_linux, hyper_v, sku='B1', number_of_workers=None,
+                            location=None, tags=None):
+
+    if is_linux and hyper_v:
+        raise CLIError('usage error: --is-linux | --hyper-v')
+    client = web_client_factory(cmd.cli_ctx)
+    sku = _normalize_sku(sku)
+    if location is None:
+        location = get_location_from_resource_group(cmd.cli_ctx, resource_group_name)
+    # the api is odd on parameter naming, have to live with it for now
+    sku_def = SkuDescription(tier=get_sku_name(sku), name=sku, capacity=number_of_workers)
+    plan_def = AppServicePlan(location=location, tags=tags, sku=sku_def,
+                              reserved=(is_linux or None), hyper_v=(hyper_v or None), name=name)
+    return client.app_service_plans.create_or_update(resource_group_name, name, plan_def)
